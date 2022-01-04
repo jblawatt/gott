@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -340,25 +342,93 @@ var editCmd = &cobra.Command{
 		// start $EDITOR
 		// parse tempfile to item
 
+		var beforeIDs []string
+
 		f, _ := ioutil.TempFile(os.TempDir(), ".md")
 		defer f.Close()
 
+		f.WriteString("# Edit below values to change tracking data\n")
+		f.WriteString("# - delete rows to delete \n")
+		f.WriteString("# - set time values 00:00 or leave empty to just set duration \n")
+		f.WriteString("# - leave duration empty or 0s if you set date \n")
+		f.WriteString("\n")
+
 		writer := tabwriter.NewWriter(f, 0, 0, 2, ' ', 0)
 		for _, i := range database.Intervals {
-			line := fmt.Sprintf("%s\t|%s\t|%s\t%|s\t%s\n", i.ID, i.Begin.Format(datetimeFormat), i.End.Format(datetimeFormat), i.Duration, i.Raw)
+			beforeIDs = append(beforeIDs, i.ID)
+			line := fmt.Sprintf(
+				"[%s]\t[%s]\t[%s]\t[%s]\t[%s]\t[%s]\n",
+				i.ID,
+				i.Begin.Format(dateFormat),
+				i.Begin.Format(timeFormat),
+				i.End.Format(timeFormat),
+				i.Duration,
+				i.Raw,
+			)
 			writer.Write([]byte(line))
 		}
 
 		writer.Flush()
+		f.WriteString("\n\n# NEW ENTRIES HERE ############################################# \n")
+		f.WriteString("# [ID (empty)] [DATE] [BEGIN] [END] [DURATION] [ANNOTATION] \n")
+		f.WriteString("# [          ] [    ] [     ] [   ] [        ] [          ] \n")
 
 		excCmd := exec.Command("nvim", f.Name())
 		excCmd.Stdout = os.Stdout
 		excCmd.Stderr = os.Stderr
 		excCmd.Stdin = os.Stdin
 		excCmd.Run()
-		fmt.Println("hello world")
+
+		f.Seek(0, 0)
+
+		scanner := bufio.NewScanner(f)
+		scanner.Split(bufio.ScanLines)
+		// pattern := regexp.MustCompile(`[(.*)] +[(.*)] +[(.*)] +[(.*)] +[(.*)] +[(.*)]`)
+		pattern := regexp.MustCompile(`\[[\w\w\-\_0-9 ]*\]`)
+
+		var afterIDs []string
+		for scanner.Scan() {
+			t := scanner.Text()
+			// ignore commented line
+			if strings.HasPrefix(t, "#") {
+				continue
+			}
+			// ignore empty line
+			if len(strings.Trim(t, " ")) == 0 {
+				continue
+			}
+
+			result := pattern.FindAllStringSubmatch(t, -1)
+			for _, row := range result {
+				var cleaned []string
+				for _, col := range row {
+					cleaned = append(cleaned, strings.Trim(stripBraces(col), " "))
+				}
+				var id, date, begin, end, duration, annotation string
+				unpack_brackets(cleaned, &id, &date, &begin, &end, &duration, &annotation)
+				if id != "" {
+					afterIDs = append(afterIDs, id)
+				}
+				if date != "" {
+					if d, err := time.Parse(dateFormat, date); err != nil {
+
+					}
+				}
+			}
+
+		}
 
 	},
+}
+
+func stripBraces(s string) string {
+	return s[1 : len(s)-1]
+}
+
+func unpack_brackets(s []string, vars ...*string) {
+	for i, str := range s {
+		*vars[i] = str
+	}
 }
 
 func PrintStatus(interval *Interval) {
