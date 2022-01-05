@@ -371,7 +371,7 @@ var editCmd = &cobra.Command{
 		writer.Flush()
 		f.WriteString("\n\n# NEW ENTRIES HERE ############################################# \n")
 		f.WriteString("# [ID (empty)] [DATE] [BEGIN] [END] [DURATION] [ANNOTATION] \n")
-		f.WriteString("# [          ] [    ] [     ] [   ] [        ] [          ] \n")
+		f.WriteString("# [] [] [] [] [] [] \n")
 
 		excCmd := exec.Command("nvim", f.Name())
 		excCmd.Stdout = os.Stdout
@@ -384,9 +384,10 @@ var editCmd = &cobra.Command{
 		scanner := bufio.NewScanner(f)
 		scanner.Split(bufio.ScanLines)
 		// pattern := regexp.MustCompile(`[(.*)] +[(.*)] +[(.*)] +[(.*)] +[(.*)] +[(.*)]`)
-		pattern := regexp.MustCompile(`\[[\w\w\-\_0-9 ]*\]`)
+		pattern := regexp.MustCompile(`\[[\w\w\-\_0-9 :]*\]`)
 
 		var afterIDs []string
+		var i int = 0
 		for scanner.Scan() {
 			t := scanner.Text()
 			// ignore commented line
@@ -397,24 +398,62 @@ var editCmd = &cobra.Command{
 			if len(strings.Trim(t, " ")) == 0 {
 				continue
 			}
-
-			result := pattern.FindAllStringSubmatch(t, -1)
-			for _, row := range result {
-				var cleaned []string
-				for _, col := range row {
-					cleaned = append(cleaned, strings.Trim(stripBraces(col), " "))
-				}
-				var id, date, begin, end, duration, annotation string
-				unpack_brackets(cleaned, &id, &date, &begin, &end, &duration, &annotation)
-				if id != "" {
-					afterIDs = append(afterIDs, id)
-				}
-				if date != "" {
-					if d, err := time.Parse(dateFormat, date); err != nil {
-
-					}
-				}
+			result := pattern.FindAllString(t, -1)
+			var cleaned []string
+			for _, col := range result {
+				cleaned = append(cleaned, strings.Trim(stripBraces(col), " "))
 			}
+			var id, date, begin, end, duration, annotation string
+			unpackSlice(cleaned, &id, &date, &begin, &end, &duration, &annotation)
+			var interval *Interval
+			annotationSlice := strings.Split(annotation, " ")
+			if id != "" {
+				afterIDs = append(afterIDs, id)
+				if intl, found := database.Get(id); found {
+					interval = intl
+				} else {
+					fmt.Fprintf(os.Stderr, "[ERROR at %d] no interval with id %s\n", i, id)
+					os.Exit(1)
+				}
+				lexInterval(annotationSlice, interval)
+			} else {
+				intv := NewInterval(annotationSlice)
+				interval = &intv
+			}
+			if date == "" {
+				fmt.Fprintf(os.Stderr, "[ERROR at %d] you have to provide a valid date. empty is not valid.\n", i)
+				os.Exit(1)
+			}
+			tdate, tdateErr := time.Parse(dateFormat, date)
+			if tdateErr != nil {
+				fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing date '%s': %s\n", i, date, tdateErr.Error())
+				os.Exit(1)
+			}
+			tbegin, terr := time.Parse(timeFormat, begin)
+			if begin != "" && terr != nil {
+				fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing begin time '%s': %s\n", i, begin, terr.Error())
+				os.Exit(1)
+			}
+			tend, tendErr := time.Parse(timeFormat, end)
+			if begin != "" tendErr != nil {
+				fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing end time '%s': %s\n", i, end, tendErr.Error())
+				os.Exit(1)
+			}
+
+			if tbegin.Format(timeFormat) != "00:00" && tend.Format(timeFormat) != "00:00" {
+				interval.Begin = tdate.Add(time.Duration(tbegin.Hour())*time.Hour + time.Duration(tbegin.Minute())*time.Minute)
+				interval.End = tdate.Add(time.Duration(tend.Hour())*time.Hour + time.Duration(tend.Minute())*time.Minute)
+			} else {
+				tdur, tdurErr := time.ParseDuration(duration)
+				if tdurErr != nil {
+					fmt.Fprintf(os.Stderr, "[ERROR at %d] no valid times and no duration.\n", i)
+					os.Exit(1)
+				}
+				interval.Begin = tbegin
+				interval.End = tbegin
+				interval.Duration = tdur
+			}
+			i += 1
 
 		}
 
@@ -425,7 +464,7 @@ func stripBraces(s string) string {
 	return s[1 : len(s)-1]
 }
 
-func unpack_brackets(s []string, vars ...*string) {
+func unpackSlice(s []string, vars ...*string) {
 	for i, str := range s {
 		*vars[i] = str
 	}
@@ -523,8 +562,12 @@ type Database struct {
 }
 
 func (d *Database) GetCurrent() (*Interval, bool) {
+	return d.Get(d.Current)
+}
+
+func (d *Database) Get(id string) (*Interval, bool) {
 	for _, i := range d.Intervals {
-		if i.ID == d.Current {
+		if i.ID == id {
 			return i, true
 		}
 	}
