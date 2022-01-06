@@ -15,6 +15,8 @@ import (
 
 	"text/tabwriter"
 
+	// github.com/r3labs/diff/v2
+
 	"github.com/cheynewallace/tabby"
 	uuid "github.com/nu7hatch/gouuid"
 	"github.com/spf13/cobra"
@@ -130,56 +132,7 @@ var summaryCmd = &cobra.Command{
 		writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 		t := tabby.NewCustom(writer)
 
-		filterList := []filterFunc{}
-
-		if len(args) > 0 {
-			for _, arg := range args {
-				switch arg {
-				case KeyToday:
-					filterList = append(filterList, createDateFilter(time.Now()))
-					continue
-				case KeyYesterday:
-					yesterday := time.Now().AddDate(0, 0, -1)
-					filterList = append(filterList, createDateFilter(yesterday))
-					continue
-				case KeyWeek:
-					begin := time.Now()
-					for begin.Weekday() != time.Monday {
-						begin = begin.AddDate(0, 0, -1)
-					}
-					filterList = append(filterList, createDateRangeFilter(begin, time.Now()))
-					continue
-				case KeyMonth:
-					begin := time.Now()
-					for begin.Day() != 1 {
-						begin = begin.AddDate(0, 0, -1)
-					}
-					filterList = append(filterList, createDateRangeFilter(begin, time.Now()))
-					continue
-				case KeyAll:
-					continue
-				default:
-					if t, err := time.Parse("2006-01-02", arg); err != nil {
-						fmt.Fprintf(os.Stderr, "ERROR: invalid summary filter %s, %s\n", arg, err.Error())
-						os.Exit(1)
-					} else {
-						filterList = append(filterList, createDateFilter(t))
-					}
-					continue
-				}
-			}
-		} else {
-			// default only today
-			filterList = append(filterList, createDateFilter(time.Now()))
-		}
-
 		t.AddHeader("CWEEK", "DAY", "BEGIN", "END", "DURATION", "PROJECT", "TAG", "ANNOTATION")
-
-		sort.SliceStable(database.Intervals, func(i, j int) bool {
-			a := database.Intervals[i]
-			b := database.Intervals[j]
-			return a.Begin.Before(b.Begin)
-		})
 
 		weekGroup := 0
 		weekText := ""
@@ -187,10 +140,15 @@ var summaryCmd = &cobra.Command{
 		dayText := ""
 		var dayDurationSum time.Duration
 		var weekDurationSum time.Duration
-		for _, interval := range database.Intervals {
-			if !applyFilter(interval, filterList) {
-				continue
-			}
+		if len(args) == 0 {
+			args = []string{KeyToday}
+		}
+		intervals, filterError := database.Filter(args)
+		if filterError != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: invalid filter: %s", filterError.Error())
+			os.Exit(1)
+		}
+		for _, interval := range intervals {
 
 			endText := "tracking..."
 			if !interval.End.IsZero() {
@@ -242,7 +200,7 @@ func DaySumLine(t *tabby.Tabby, dur time.Duration) {
 
 func WeekSumLine(t *tabby.Tabby, dur time.Duration) {
 	if dur > 0 {
-		t.AddLine("wk =", "", "", "", fmtDuration(dur), "", "", "")
+		t.AddLine("", "", "wk =", "", fmtDuration(dur), "", "", "")
 	}
 }
 
@@ -332,129 +290,173 @@ var cancelCmd = &cobra.Command{
 	},
 }
 
+func writeEditFile(f *os.File, intervals []*Interval, filterArgs []string) {
+
+	f.WriteString("# Edit below values to change tracking data\n")
+	f.WriteString("# - delete rows to delete \n")
+	f.WriteString("# - set time values 00:00 or leave empty to just set duration \n")
+	f.WriteString("# - leave duration empty or 0s if you set date \n")
+	f.WriteString("\n")
+
+	writer := tabwriter.NewWriter(f, 0, 0, 2, ' ', 0)
+	for _, i := range intervals {
+		line := fmt.Sprintf(
+			"[%s]\t[%s]\t[%s]\t[%s]\t[%s]\t[%s]\n",
+			i.ID,
+			i.Begin.Format(dateFormat),
+			i.Begin.Format(timeFormat),
+			i.End.Format(timeFormat),
+			i.Duration,
+			i.Raw,
+		)
+		writer.Write([]byte(line))
+	}
+
+	writer.Flush()
+
+	f.WriteString("\n\n# NEW ENTRIES HERE #############################################\n")
+	f.WriteString("# [ID (empty)] [DATE] [BEGIN] [END] [DURATION] [ANNOTATION]\n")
+	f.WriteString("\n# [] [] [] [] [] []\n")
+
+	f.WriteString("\n\n\n\n# meta #########################################################\n")
+	f.WriteString(fmt.Sprintf("# ;; filter == %s\n", strings.Join(filterArgs, " ")))
+
+}
+
+func runEditFile(f *os.File) {
+	excCmd := exec.Command("nvim", f.Name())
+	excCmd.Stdout = os.Stdout
+	excCmd.Stderr = os.Stderr
+	excCmd.Stdin = os.Stdin
+	excCmd.Run()
+}
+
+func parseEditLine(t string) (Interval, error) {
+
+	pattern := regexp.MustCompile(`\[[\w\w\-\_0-9 :]*\]`)
+	result := pattern.FindAllString(t, -1)
+	var cleaned []string
+	for _, col := range result {
+		cleaned = append(cleaned, strings.Trim(stripBraces(col), " "))
+	}
+	var id, date, begin, end, duration, annotation string
+	unpackSlice(cleaned, &id, &date, &begin, &end, &duration, &annotation)
+	var interval Interval
+	annotationSlice := strings.Split(annotation, " ")
+
+	if id != "" {
+		if intl, found := database.Get(id); found {
+			interval = intl
+		} else {
+			return errors.New("")
+			fmt.Fprintf(os.Stderr, "[ERROR at %d] no interval with id %s\n", line, id)
+			os.Exit(1)
+		}
+		lexInterval(annotationSlice, interval)
+	} else {
+		intv := NewInterval(annotationSlice)
+		interval = &intv
+		database.AppendPtr(interval)
+	}
+	if date == "" {
+		fmt.Fprintf(os.Stderr, "[ERROR at %d] you have to provide a valid date. empty is not valid.\n", line)
+		os.Exit(1)
+	}
+	tdate, tdateErr := time.Parse(dateFormat, date)
+	if tdateErr != nil {
+		fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing date '%s': %s\n", line, date, tdateErr.Error())
+		os.Exit(1)
+	}
+	tbegin, terr := time.Parse(timeFormat, begin)
+	if begin != "" && terr != nil {
+		fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing begin time '%s': %s\n", line, begin, terr.Error())
+		os.Exit(1)
+	}
+	tend, tendErr := time.Parse(timeFormat, end)
+	if begin != "" && tendErr != nil {
+		fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing end time '%s': %s\n", line, end, tendErr.Error())
+		os.Exit(1)
+	}
+	if tbegin.Format(timeFormat) != "00:00" && tend.Format(timeFormat) != "00:00" {
+		interval.Begin = tdate.Add(time.Duration(tbegin.Hour())*time.Hour + time.Duration(tbegin.Minute())*time.Minute)
+		interval.End = tdate.Add(time.Duration(tend.Hour())*time.Hour + time.Duration(tend.Minute())*time.Minute)
+	} else {
+		tdur, tdurErr := time.ParseDuration(duration)
+		if tdurErr != nil {
+			fmt.Fprintf(os.Stderr, "[ERROR at %d] no valid times and no duration.\n", line)
+			os.Exit(1)
+		}
+		interval.Begin = tdate
+		interval.End = tdate
+		interval.Duration = tdur
+	}
+	return interval, nil
+}
+
+func parseEditFile(f *os.File) ([]Interval, error) {
+	scanner := bufio.NewScanner(f)
+	scanner.Split(bufio.ScanLines)
+	var result []Interval
+	var line = 1
+	// 	var line int = 1
+	for scanner.Scan() {
+		t := scanner.Text()
+		// ignore commented line
+		if strings.HasPrefix(t, "#") {
+			line += 1
+			continue
+		}
+		// ignore empty line
+		if len(strings.Trim(t, " ")) == 0 {
+			line += 1
+			continue
+		}
+		if i, err := parseEditLine(t); err != nil {
+			return []Interval{}, err
+		} else {
+			line += 1
+			result = append(result, i)
+		}
+	}
+
+	return result, nil
+}
+
 var editCmd = &cobra.Command{
 	Use:   "edit",
 	Short: "Edit the intervals in the provided timespan",
 	Run: func(cmd *cobra.Command, args []string) {
-		// filter
-		// create tempfile
-		// write tabtable to tempfile
-		// start $EDITOR
-		// parse tempfile to item
+
+		if len(args) == 0 {
+			args = []string{KeyToday}
+		}
+		intervals, errFilter := database.Filter(args)
+		if errFilter != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: invalid filter: %s", errFilter.Error())
+			os.Exit(1)
+		}
 
 		var beforeIDs []string
+		for _, i := range intervals {
+			beforeIDs = append(beforeIDs, i.ID)
+		}
 
 		f, _ := ioutil.TempFile(os.TempDir(), ".md")
 		defer f.Close()
 
-		f.WriteString("# Edit below values to change tracking data\n")
-		f.WriteString("# - delete rows to delete \n")
-		f.WriteString("# - set time values 00:00 or leave empty to just set duration \n")
-		f.WriteString("# - leave duration empty or 0s if you set date \n")
-		f.WriteString("\n")
-
-		writer := tabwriter.NewWriter(f, 0, 0, 2, ' ', 0)
-		for _, i := range database.Intervals {
-			beforeIDs = append(beforeIDs, i.ID)
-			line := fmt.Sprintf(
-				"[%s]\t[%s]\t[%s]\t[%s]\t[%s]\t[%s]\n",
-				i.ID,
-				i.Begin.Format(dateFormat),
-				i.Begin.Format(timeFormat),
-				i.End.Format(timeFormat),
-				i.Duration,
-				i.Raw,
-			)
-			writer.Write([]byte(line))
-		}
-
-		writer.Flush()
-		f.WriteString("\n\n# NEW ENTRIES HERE ############################################# \n")
-		f.WriteString("# [ID (empty)] [DATE] [BEGIN] [END] [DURATION] [ANNOTATION] \n")
-		f.WriteString("# [] [] [] [] [] [] \n")
-
-		excCmd := exec.Command("nvim", f.Name())
-		excCmd.Stdout = os.Stdout
-		excCmd.Stderr = os.Stderr
-		excCmd.Stdin = os.Stdin
-		excCmd.Run()
+		writeEditFile(f, intervals, args)
+		runEditFile(f)
 
 		f.Seek(0, 0)
 
-		scanner := bufio.NewScanner(f)
-		scanner.Split(bufio.ScanLines)
-		// pattern := regexp.MustCompile(`[(.*)] +[(.*)] +[(.*)] +[(.*)] +[(.*)] +[(.*)]`)
-		pattern := regexp.MustCompile(`\[[\w\w\-\_0-9 :]*\]`)
-
 		var afterIDs []string
-		var i int = 0
-		for scanner.Scan() {
-			t := scanner.Text()
-			// ignore commented line
-			if strings.HasPrefix(t, "#") {
-				continue
-			}
-			// ignore empty line
-			if len(strings.Trim(t, " ")) == 0 {
-				continue
-			}
-			result := pattern.FindAllString(t, -1)
-			var cleaned []string
-			for _, col := range result {
-				cleaned = append(cleaned, strings.Trim(stripBraces(col), " "))
-			}
-			var id, date, begin, end, duration, annotation string
-			unpackSlice(cleaned, &id, &date, &begin, &end, &duration, &annotation)
-			var interval *Interval
-			annotationSlice := strings.Split(annotation, " ")
-			if id != "" {
-				afterIDs = append(afterIDs, id)
-				if intl, found := database.Get(id); found {
-					interval = intl
-				} else {
-					fmt.Fprintf(os.Stderr, "[ERROR at %d] no interval with id %s\n", i, id)
-					os.Exit(1)
-				}
-				lexInterval(annotationSlice, interval)
-			} else {
-				intv := NewInterval(annotationSlice)
-				interval = &intv
-			}
-			if date == "" {
-				fmt.Fprintf(os.Stderr, "[ERROR at %d] you have to provide a valid date. empty is not valid.\n", i)
-				os.Exit(1)
-			}
-			tdate, tdateErr := time.Parse(dateFormat, date)
-			if tdateErr != nil {
-				fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing date '%s': %s\n", i, date, tdateErr.Error())
-				os.Exit(1)
-			}
-			tbegin, terr := time.Parse(timeFormat, begin)
-			if begin != "" && terr != nil {
-				fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing begin time '%s': %s\n", i, begin, terr.Error())
-				os.Exit(1)
-			}
-			tend, tendErr := time.Parse(timeFormat, end)
-			if begin != "" tendErr != nil {
-				fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing end time '%s': %s\n", i, end, tendErr.Error())
-				os.Exit(1)
-			}
 
-			if tbegin.Format(timeFormat) != "00:00" && tend.Format(timeFormat) != "00:00" {
-				interval.Begin = tdate.Add(time.Duration(tbegin.Hour())*time.Hour + time.Duration(tbegin.Minute())*time.Minute)
-				interval.End = tdate.Add(time.Duration(tend.Hour())*time.Hour + time.Duration(tend.Minute())*time.Minute)
-			} else {
-				tdur, tdurErr := time.ParseDuration(duration)
-				if tdurErr != nil {
-					fmt.Fprintf(os.Stderr, "[ERROR at %d] no valid times and no duration.\n", i)
-					os.Exit(1)
+		if len(beforeIDs) != len(afterIDs) {
+			for _, beforeID := range beforeIDs {
+				if !containsString(afterIDs, beforeID) {
+					database.RemoveById(beforeID)
 				}
-				interval.Begin = tbegin
-				interval.End = tbegin
-				interval.Duration = tdur
 			}
-			i += 1
-
 		}
 
 	},
@@ -607,7 +609,78 @@ func (d *Database) Stop() {
 }
 
 func (d *Database) Append(interval Interval) {
-	d.Intervals = append(d.Intervals, &interval)
+	d.AppendPtr(&interval)
+}
+
+func (d *Database) AppendPtr(interval *Interval) {
+	d.Intervals = append(d.Intervals, interval)
+}
+
+func (d *Database) RemoveById(id string) {
+	// TODO optimize
+	for i, interval := range d.Intervals {
+		if interval.ID == id {
+			d.Intervals = append(d.Intervals[:i], d.Intervals[i+1:]...)
+		}
+	}
+}
+
+func (d *Database) Filter(args []string) ([]*Interval, error) {
+	var resultSet []*Interval
+
+	filterList := []filterFunc{}
+
+	if len(args) > 0 {
+		for _, arg := range args {
+			switch arg {
+			case KeyToday:
+				filterList = append(filterList, createDateFilter(time.Now()))
+				continue
+			case KeyYesterday:
+				yesterday := time.Now().AddDate(0, 0, -1)
+				filterList = append(filterList, createDateFilter(yesterday))
+				continue
+			case KeyWeek:
+				begin := time.Now()
+				for begin.Weekday() != time.Monday {
+					begin = begin.AddDate(0, 0, -1)
+				}
+				filterList = append(filterList, createDateRangeFilter(begin, time.Now()))
+				continue
+			case KeyMonth:
+				begin := time.Now()
+				for begin.Day() != 1 {
+					begin = begin.AddDate(0, 0, -1)
+				}
+				filterList = append(filterList, createDateRangeFilter(begin, time.Now()))
+				continue
+			case KeyAll:
+				continue
+			default:
+				if t, err := time.Parse("2006-01-02", arg); err != nil {
+					return resultSet, fmt.Errorf("invalid summary filter %s, %s\n", arg, err.Error())
+				} else {
+					filterList = append(filterList, createDateFilter(t))
+				}
+				continue
+			}
+		}
+	}
+
+	// sort by date
+	sort.SliceStable(database.Intervals, func(i, j int) bool {
+		a := database.Intervals[i]
+		b := database.Intervals[j]
+		return a.Begin.Before(b.Begin)
+	})
+
+	for _, interval := range database.Intervals {
+		if applyFilter(interval, filterList) {
+			resultSet = append(resultSet, interval)
+		}
+	}
+
+	return resultSet, nil
 }
 
 func Hook(name string, interval *Interval) {}
