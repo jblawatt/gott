@@ -15,6 +15,7 @@ import (
 	// github.com/r3labs/diff/v2
 
 	"github.com/cheynewallace/tabby"
+	uuid "github.com/nu7hatch/gouuid"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -104,7 +105,7 @@ var summaryCmd = &cobra.Command{
 		}
 		if len(args) > 1 {
 			return fmt.Errorf(
-				"Args should only be one. Choose one of the keys %s, %s, %s, %s or %s or provide in the format YYYY-MM-DD",
+				"args should only be one. Choose one of the keys %s, %s, %s, %s or %s or provide in the format YYYY-MM-DD",
 				KeyToday, KeyYesterday, KeyWeek, KeyMonth, KeyAll,
 			)
 		}
@@ -116,7 +117,7 @@ var summaryCmd = &cobra.Command{
 		}
 		if _, err := time.Parse(dateFormat, args[0]); err != nil {
 			return fmt.Errorf(
-				"Invalid date format. Choose one of the keys %s, %s, %s, %s or %s or provide in the format YYYY-MM-DD",
+				"invalid date format. Choose one of the keys %s, %s, %s, %s or %s or provide in the format YYYY-MM-DD",
 				KeyToday, KeyYesterday, KeyMonth, KeyWeek, KeyAll,
 			)
 
@@ -273,8 +274,6 @@ var continueCmd = &cobra.Command{
 			database.Start(NewInterval(strings.Split(latest.Raw, " ")))
 			PrintRunningStatus()
 		}
-		if database.Count() > 0 {
-		}
 	},
 }
 
@@ -301,7 +300,7 @@ func writeEditFile(f *os.File, intervals []*Interval, filterArgs []string) {
 	writer := tabwriter.NewWriter(f, 0, 0, 2, ' ', 0)
 	for _, i := range intervals {
 		line := fmt.Sprintf(
-			"[%s]\t[%s]\t[%s]\t[%s]\t[%s]\t[%s]\n",
+			"(%s)\t(%s)\t(%s)\t(%s)\t(%s)\t(%s)\n",
 			i.ID,
 			i.Begin.Format(dateFormat),
 			i.Begin.Format(timeFormat),
@@ -315,8 +314,8 @@ func writeEditFile(f *os.File, intervals []*Interval, filterArgs []string) {
 	writer.Flush()
 
 	f.WriteString("\n\n# NEW ENTRIES HERE #############################################\n")
-	f.WriteString("# [ID (empty)] [DATE] [BEGIN] [END] [DURATION] [ANNOTATION]\n")
-	f.WriteString(fmt.Sprintf("\n# [] [%s] [] [] [] []\n", time.Now().Format(dateFormat)))
+	f.WriteString("# (ID [leave empty]) (DATE) (BEGIN) (END) (DURATION) (ANNOTATION)\n")
+	f.WriteString(fmt.Sprintf("\n# () (%s) () () () ()\n", time.Now().Format(dateFormat)))
 
 	f.WriteString("\n\n\n\n# meta #########################################################\n")
 	f.WriteString(fmt.Sprintf("# ;; filter == %s\n", strings.Join(filterArgs, " ")))
@@ -331,36 +330,37 @@ func runEditFile(f *os.File) {
 	excCmd.Run()
 }
 
-func parseEditLine(t string) (Interval, error) {
+func parseEditLine(line string) (Interval, error) {
 
-	pattern := regexp.MustCompile(`\[[\w\w\-\_0-9 :]*\]`)
-	result := pattern.FindAllString(t, -1)
+	pattern := regexp.MustCompile(`\([\w\-\_0-9 :]*\)`)
+	result := pattern.FindAllString(line, -1)
 	var cleaned []string
 	for _, col := range result {
 		cleaned = append(cleaned, strings.Trim(stripBraces(col), " "))
 	}
+
 	var id, date, begin, end, duration, annotation string
 	unpackSlice(cleaned, &id, &date, &begin, &end, &duration, &annotation)
 	annotationSlice := strings.Split(annotation, " ")
 	interval := NewInterval(annotationSlice)
 
 	if date == "" {
-		return interval, fmt.Errorf("Date is empty but should be filled with format YYYY-MM-DD")
+		return interval, fmt.Errorf("date is empty but should be filled with format YYYY-MM-DD")
 	}
 
 	tdate, tdateErr := time.Parse(dateFormat, date)
 	if tdateErr != nil {
-		return interval, fmt.Errorf("Error parsing date '%s'. Error: %s", date, tdateErr.Error())
+		return interval, fmt.Errorf("error parsing date '%s'. Error: %s", date, tdateErr.Error())
 	}
 
 	tbegin, terr := time.Parse(timeFormat, begin)
 	if begin != "" && terr != nil {
-		return interval, fmt.Errorf("Error parsing begin time '%s': %s", begin, terr.Error())
+		return interval, fmt.Errorf("error parsing begin time '%s': %s", begin, terr.Error())
 	}
 
 	tend, tendErr := time.Parse(timeFormat, end)
 	if begin != "" && tendErr != nil {
-		return interval, fmt.Errorf("Error parsing end time '%s': %s", end, tendErr.Error())
+		return interval, fmt.Errorf("error parsing end time '%s': %s", end, tendErr.Error())
 	}
 
 	if tbegin.Format(timeFormat) != "00:00" && tend.Format(timeFormat) != "00:00" {
@@ -369,7 +369,7 @@ func parseEditLine(t string) (Interval, error) {
 	} else {
 		tdur, tdurErr := time.ParseDuration(duration)
 		if tdurErr != nil {
-			return interval, fmt.Errorf("Error parsing duration: %s", tdurErr.Error())
+			return interval, fmt.Errorf("error parsing duration: %s", tdurErr.Error())
 		}
 		interval.Begin = tdate
 		interval.End = tdate
@@ -385,7 +385,6 @@ func parseEditFile(f *os.File) ([]Interval, error) {
 	var result []Interval
 	var line = 1
 	var pos int64 = 0
-	// 	var line int = 1
 	for scanner.Scan() {
 		t := scanner.Text()
 
@@ -401,7 +400,7 @@ func parseEditFile(f *os.File) ([]Interval, error) {
 			continue
 		}
 		if i, err := parseEditLine(t); err != nil {
-			return []Interval{}, err
+			return nil, err
 		} else {
 			line += 1
 			result = append(result, i)
@@ -435,14 +434,24 @@ var editCmd = &cobra.Command{
 		defer os.Remove(f.Name())
 
 		writeEditFile(f, intervals, args)
-		runEditFile(f)
 
-		f.Seek(0, 0)
+		beforeContent, _ := ioutil.ReadFile(f.Name())
+		runEditFile(f)
+		afterContent, _ := ioutil.ReadFile(f.Name())
+
+		if string(beforeContent) == string(afterContent) {
+			fmt.Println("file unchanged. nothing to do.")
+			return
+		}
 
 		// TODO: optimize:
 		// - test if content changed
 		// - test diff content and not walk through it
 		// - do not update every interval
+		// - better diff
+
+		f.Seek(0, 0)
+
 		editIntervals, err := parseEditFile(f)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: error in parsing file: %s", err.Error())
@@ -453,6 +462,8 @@ var editCmd = &cobra.Command{
 
 		for _, intv := range editIntervals {
 			if intv.ID == "" {
+				id, _ := uuid.NewV4()
+				intv.ID = id.String()
 				database.Append(intv)
 			} else {
 				database.Apply(intv)
