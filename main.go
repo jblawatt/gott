@@ -2,14 +2,11 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 
@@ -18,7 +15,6 @@ import (
 	// github.com/r3labs/diff/v2
 
 	"github.com/cheynewallace/tabby"
-	uuid "github.com/nu7hatch/gouuid"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -270,10 +266,14 @@ var continueCmd = &cobra.Command{
 			fmt.Fprintln(os.Stderr, "ERROR: there is a tracking in progress. Nothing to continue.")
 			os.Exit(1)
 		}
-		if len(database.Intervals) > 0 {
-			last := database.Intervals[len(database.Intervals)-1]
-			database.Start(NewInterval(strings.Split(last.Raw, " ")))
+		if latest, err := database.Latest(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", err.Error())
+			os.Exit(1)
+		} else {
+			database.Start(NewInterval(strings.Split(latest.Raw, " ")))
 			PrintRunningStatus()
+		}
+		if database.Count() > 0 {
 		}
 	},
 }
@@ -316,7 +316,7 @@ func writeEditFile(f *os.File, intervals []*Interval, filterArgs []string) {
 
 	f.WriteString("\n\n# NEW ENTRIES HERE #############################################\n")
 	f.WriteString("# [ID (empty)] [DATE] [BEGIN] [END] [DURATION] [ANNOTATION]\n")
-	f.WriteString("\n# [] [] [] [] [] []\n")
+	f.WriteString(fmt.Sprintf("\n# [] [%s] [] [] [] []\n", time.Now().Format(dateFormat)))
 
 	f.WriteString("\n\n\n\n# meta #########################################################\n")
 	f.WriteString(fmt.Sprintf("# ;; filter == %s\n", strings.Join(filterArgs, " ")))
@@ -341,55 +341,41 @@ func parseEditLine(t string) (Interval, error) {
 	}
 	var id, date, begin, end, duration, annotation string
 	unpackSlice(cleaned, &id, &date, &begin, &end, &duration, &annotation)
-	var interval Interval
 	annotationSlice := strings.Split(annotation, " ")
+	interval := NewInterval(annotationSlice)
 
-	if id != "" {
-		if intl, found := database.Get(id); found {
-			interval = intl
-		} else {
-			return errors.New("")
-			fmt.Fprintf(os.Stderr, "[ERROR at %d] no interval with id %s\n", line, id)
-			os.Exit(1)
-		}
-		lexInterval(annotationSlice, interval)
-	} else {
-		intv := NewInterval(annotationSlice)
-		interval = &intv
-		database.AppendPtr(interval)
-	}
 	if date == "" {
-		fmt.Fprintf(os.Stderr, "[ERROR at %d] you have to provide a valid date. empty is not valid.\n", line)
-		os.Exit(1)
+		return interval, fmt.Errorf("Date is empty but should be filled with format YYYY-MM-DD")
 	}
+
 	tdate, tdateErr := time.Parse(dateFormat, date)
 	if tdateErr != nil {
-		fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing date '%s': %s\n", line, date, tdateErr.Error())
-		os.Exit(1)
+		return interval, fmt.Errorf("Error parsing date '%s'. Error: %s", date, tdateErr.Error())
 	}
+
 	tbegin, terr := time.Parse(timeFormat, begin)
 	if begin != "" && terr != nil {
-		fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing begin time '%s': %s\n", line, begin, terr.Error())
-		os.Exit(1)
+		return interval, fmt.Errorf("Error parsing begin time '%s': %s", begin, terr.Error())
 	}
+
 	tend, tendErr := time.Parse(timeFormat, end)
 	if begin != "" && tendErr != nil {
-		fmt.Fprintf(os.Stderr, "[ERROR at %d] parsing end time '%s': %s\n", line, end, tendErr.Error())
-		os.Exit(1)
+		return interval, fmt.Errorf("Error parsing end time '%s': %s", end, tendErr.Error())
 	}
+
 	if tbegin.Format(timeFormat) != "00:00" && tend.Format(timeFormat) != "00:00" {
 		interval.Begin = tdate.Add(time.Duration(tbegin.Hour())*time.Hour + time.Duration(tbegin.Minute())*time.Minute)
 		interval.End = tdate.Add(time.Duration(tend.Hour())*time.Hour + time.Duration(tend.Minute())*time.Minute)
 	} else {
 		tdur, tdurErr := time.ParseDuration(duration)
 		if tdurErr != nil {
-			fmt.Fprintf(os.Stderr, "[ERROR at %d] no valid times and no duration.\n", line)
-			os.Exit(1)
+			return interval, fmt.Errorf("Error parsing duration: %s", tdurErr.Error())
 		}
 		interval.Begin = tdate
 		interval.End = tdate
 		interval.Duration = tdur
 	}
+	interval.ID = id
 	return interval, nil
 }
 
@@ -398,9 +384,12 @@ func parseEditFile(f *os.File) ([]Interval, error) {
 	scanner.Split(bufio.ScanLines)
 	var result []Interval
 	var line = 1
+	var pos int64 = 0
 	// 	var line int = 1
 	for scanner.Scan() {
 		t := scanner.Text()
+
+		pos += int64(len(t) + 1)
 		// ignore commented line
 		if strings.HasPrefix(t, "#") {
 			line += 1
@@ -443,13 +432,33 @@ var editCmd = &cobra.Command{
 
 		f, _ := ioutil.TempFile(os.TempDir(), ".md")
 		defer f.Close()
+		defer os.Remove(f.Name())
 
 		writeEditFile(f, intervals, args)
 		runEditFile(f)
 
 		f.Seek(0, 0)
 
+		// TODO: optimize:
+		// - test if content changed
+		// - test diff content and not walk through it
+		// - do not update every interval
+		editIntervals, err := parseEditFile(f)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: error in parsing file: %s", err.Error())
+			os.Exit(1)
+		}
+
 		var afterIDs []string
+
+		for _, intv := range editIntervals {
+			if intv.ID == "" {
+				database.Append(intv)
+			} else {
+				database.Apply(intv)
+				afterIDs = append(afterIDs, intv.ID)
+			}
+		}
 
 		if len(beforeIDs) != len(afterIDs) {
 			for _, beforeID := range beforeIDs {
@@ -488,12 +497,9 @@ func PrintStatus(interval *Interval) {
 
 	curDiff := time.Now().Sub(interval.Begin)
 	var todayDur time.Duration
-	now := time.Now()
-	for _, i := range database.Intervals {
-		// TODO: better check with end also
-		if i.Begin.Year() == now.Year() && i.Begin.Month() == now.Month() && i.Begin.Day() == now.Day() {
-			todayDur += i.GetDuration()
-		}
+	intervals, _ := database.Filter([]string{KeyToday})
+	for _, i := range intervals {
+		todayDur += i.GetDuration()
 	}
 	t := tabby.New()
 	t.AddLine("\t", "Started", interval.Begin.Format(datetimeFormatShort))
@@ -501,7 +507,7 @@ func PrintStatus(interval *Interval) {
 		t.AddLine("\t", "Stopped", interval.Begin.Format(datetimeFormatShort))
 	}
 	t.AddLine("\t", "Current (mins)", fmtDuration(curDiff))
-	t.AddLine("\t", "Total (today)", fmtDuration(todayDur))
+	t.AddLine("\t", "Total   (today)", fmtDuration(todayDur))
 	t.Print()
 
 }
@@ -520,168 +526,6 @@ const (
 	StatusStarted = "started"
 	StatusEnded   = "ended"
 )
-
-type Interval struct {
-	ID         string
-	Begin      time.Time
-	End        time.Time
-	Duration   time.Duration
-	Tags       []string
-	Project    string
-	Ref        string
-	Annotation string
-	Raw        string
-	UDA        map[string]interface{}
-	Status     string
-}
-
-func (i *Interval) GetDuration() time.Duration {
-	// completely the same. duration only
-	if i.End.Equal(i.Begin) {
-		return i.Duration
-	}
-	if i.End.IsZero() {
-		return time.Now().Sub(i.Begin)
-	}
-	return i.End.Sub(i.Begin)
-}
-
-func NewInterval(raw []string) (interval Interval) {
-	id, _ := uuid.NewV4()
-	interval.ID = id.String()
-	lexInterval(raw, &interval)
-	return interval
-}
-
-func StopInterval(i *Interval) {
-	i.End = time.Now()
-	i.Status = StatusEnded
-}
-
-type Database struct {
-	Current   string
-	Intervals []*Interval
-}
-
-func (d *Database) GetCurrent() (*Interval, bool) {
-	return d.Get(d.Current)
-}
-
-func (d *Database) Get(id string) (*Interval, bool) {
-	for _, i := range d.Intervals {
-		if i.ID == id {
-			return i, true
-		}
-	}
-	return &Interval{}, false
-}
-
-func (d *Database) Start(interval Interval) {
-	interval.Begin = time.Now()
-	interval.Status = StatusStarted
-	d.Intervals = append(d.Intervals, &interval)
-	if d.Current != "" {
-		d.Stop()
-	}
-	d.Current = interval.ID
-}
-
-func (d *Database) Cancel() {
-	if cur, found := d.GetCurrent(); found {
-		for i, interval := range d.Intervals {
-			if cur.ID == interval.ID {
-				d.Intervals = append(d.Intervals[:i], d.Intervals[i+1:]...)
-				d.Current = ""
-				break
-			}
-		}
-	}
-}
-
-func (d *Database) Stop() {
-	for _, interval := range d.Intervals {
-		if interval.ID == d.Current {
-			d.Current = ""
-			StopInterval(interval)
-			break
-		}
-	}
-}
-
-func (d *Database) Append(interval Interval) {
-	d.AppendPtr(&interval)
-}
-
-func (d *Database) AppendPtr(interval *Interval) {
-	d.Intervals = append(d.Intervals, interval)
-}
-
-func (d *Database) RemoveById(id string) {
-	// TODO optimize
-	for i, interval := range d.Intervals {
-		if interval.ID == id {
-			d.Intervals = append(d.Intervals[:i], d.Intervals[i+1:]...)
-		}
-	}
-}
-
-func (d *Database) Filter(args []string) ([]*Interval, error) {
-	var resultSet []*Interval
-
-	filterList := []filterFunc{}
-
-	if len(args) > 0 {
-		for _, arg := range args {
-			switch arg {
-			case KeyToday:
-				filterList = append(filterList, createDateFilter(time.Now()))
-				continue
-			case KeyYesterday:
-				yesterday := time.Now().AddDate(0, 0, -1)
-				filterList = append(filterList, createDateFilter(yesterday))
-				continue
-			case KeyWeek:
-				begin := time.Now()
-				for begin.Weekday() != time.Monday {
-					begin = begin.AddDate(0, 0, -1)
-				}
-				filterList = append(filterList, createDateRangeFilter(begin, time.Now()))
-				continue
-			case KeyMonth:
-				begin := time.Now()
-				for begin.Day() != 1 {
-					begin = begin.AddDate(0, 0, -1)
-				}
-				filterList = append(filterList, createDateRangeFilter(begin, time.Now()))
-				continue
-			case KeyAll:
-				continue
-			default:
-				if t, err := time.Parse("2006-01-02", arg); err != nil {
-					return resultSet, fmt.Errorf("invalid summary filter %s, %s\n", arg, err.Error())
-				} else {
-					filterList = append(filterList, createDateFilter(t))
-				}
-				continue
-			}
-		}
-	}
-
-	// sort by date
-	sort.SliceStable(database.Intervals, func(i, j int) bool {
-		a := database.Intervals[i]
-		b := database.Intervals[j]
-		return a.Begin.Before(b.Begin)
-	})
-
-	for _, interval := range database.Intervals {
-		if applyFilter(interval, filterList) {
-			resultSet = append(resultSet, interval)
-		}
-	}
-
-	return resultSet, nil
-}
 
 func Hook(name string, interval *Interval) {}
 
@@ -777,19 +621,6 @@ var database Database
 
 const databaseFilename = "db.json"
 
-func loadDatabase(name string) {
-	if _, err := os.Stat(name); errors.Is(err, os.ErrNotExist) {
-		saveDatabase(name)
-	}
-	file, _ := ioutil.ReadFile(databaseFilename)
-	_ = json.Unmarshal([]byte(file), &database)
-}
-
-func saveDatabase(name string) {
-	data, _ := json.Marshal(database)
-	ioutil.WriteFile(name, data, 0644)
-}
-
 const (
 	ConfDatabaseName = "databasename"
 )
@@ -819,11 +650,11 @@ func init() {
 	rootCmd.AddCommand(editCmd)
 
 	databaseName := viper.GetString(ConfDatabaseName)
-	loadDatabase(databaseName)
+	database = NewDatabaseJson(databaseName)
+	database.Load()
 }
 
 func main() {
-	databaseName := viper.GetString(ConfDatabaseName)
-	defer saveDatabase(databaseName)
+	defer database.Save()
 	execute()
 }
