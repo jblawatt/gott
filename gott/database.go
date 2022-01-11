@@ -33,6 +33,10 @@ type Database interface {
 	Latest() (*Interval, error)
 }
 
+type FilterableDatabase interface {
+	Filter(args []string) ([]*Interval, error)
+}
+
 type DatabaseJson struct {
 	filename  string
 	Current   string

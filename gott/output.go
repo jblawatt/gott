@@ -19,30 +19,31 @@ func WeekSumLine(t *tabby.Tabby, dur time.Duration) {
 		t.AddLine("", "", "wk =", "", fmtDuration(dur), "", "", "")
 	}
 }
-func PrintStatus(interval *Interval) {
 
-	fmt.Printf("tracking %s", interval.Annotation)
-	if interval.Project != "" {
-		fmt.Printf(" -- proj:%s", interval.Project)
+func PrintStatus(current *Interval, db FilterableDatabase) {
+
+	fmt.Printf("tracking %s", current.Annotation)
+	if current.Project != "" {
+		fmt.Printf(" -- proj:%s", current.Project)
 	}
-	if len(interval.Tags) > 0 {
-		fmt.Printf(" -- %s", strings.Join(interval.Tags, ", "))
+	if len(current.Tags) > 0 {
+		fmt.Printf(" -- %s", strings.Join(current.Tags, ", "))
 	}
-	if interval.Ref != "" {
-		fmt.Printf(" -- ref:%s", interval.Ref)
+	if current.Ref != "" {
+		fmt.Printf(" -- ref:%s", current.Ref)
 	}
 	fmt.Printf("\n")
 
-	curDiff := time.Now().Sub(interval.Begin)
+	curDiff := time.Since(current.Begin)
 	var todayDur time.Duration
-	intervals, _ := database.Filter([]string{KeyToday})
+	intervals, _ := db.Filter([]string{KeyToday})
 	for _, i := range intervals {
 		todayDur += i.GetDuration()
 	}
 	t := tabby.New()
-	t.AddLine("\t", "Started", interval.Begin.Format(datetimeFormatShort))
-	if !interval.End.IsZero() {
-		t.AddLine("\t", "Stopped", interval.Begin.Format(datetimeFormatShort))
+	t.AddLine("\t", "Started", current.Begin.Format(datetimeFormatShort))
+	if !current.End.IsZero() {
+		t.AddLine("\t", "Stopped", current.Begin.Format(datetimeFormatShort))
 	}
 	t.AddLine("\t", "Current (mins)", fmtDuration(curDiff))
 	t.AddLine("\t", "Total   (today)", fmtDuration(todayDur))
@@ -54,7 +55,7 @@ func PrintRunningStatus() {
 	if current, found := database.GetCurrent(); !found {
 		fmt.Println("<< no tracking in progress >>")
 	} else {
-		PrintStatus(current)
+		PrintStatus(current, database)
 	}
 }
 

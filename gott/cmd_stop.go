@@ -15,7 +15,7 @@ var stopCmd = &cobra.Command{
 		if !found {
 			fmt.Println("<< no tracking in progress >>")
 		} else {
-			PrintStatus(current)
+			PrintStatus(current, database)
 		}
 	},
 }
