@@ -1,4 +1,4 @@
-package main
+package gott
 
 import (
 	"time"
@@ -6,7 +6,13 @@ import (
 	uuid "github.com/nu7hatch/gouuid"
 )
 
+const (
+	StatusStarted = "started"
+	StatusEnded   = "ended"
+)
+
 type Interval struct {
+	// Interval Status
 	ID         string
 	Begin      time.Time
 	End        time.Time

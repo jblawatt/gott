@@ -1,4 +1,4 @@
-package main
+package gott
 
 import (
 	"encoding/json"
@@ -8,6 +8,11 @@ import (
 	"os"
 	"sort"
 	"time"
+)
+
+const (
+	ConfDatabaseName = "databasename"
+	databseFilename  = "db.json"
 )
 
 type Database interface {
