@@ -1,0 +1,55 @@
+#!/usr/bin/python3
+
+import sys
+import json
+import subprocess
+
+
+GOTT_EXEC = "gott"
+
+
+try:
+    input_stream = sys.stdin.buffer
+except AttributeError:
+    input_stream = sys.stdin
+
+
+def extract_text(json_obj):
+    message = [json_obj["description"]]
+
+    if 'project' in json_obj:
+        message.append("project:" + json_obj['project'])
+
+    if 'tags' in json_obj:
+        message.extend("+" + json_obj['tags'])
+
+    if 'uuid' in json_obj:
+        message.append("ref:" + json_obj['uuid'])
+
+    return message
+
+
+if __name__ == "__main__":
+
+    # Make no changes to the task, simply observe.
+    old = json.loads(input_stream.readline().decode("utf-8", errors="replace"))
+    new = json.loads(input_stream.readline().decode("utf-8", errors="replace"))
+    print(json.dumps(new))
+
+    message_new = extract_text(new)
+
+    # Started task.
+    if 'start' in new and 'start' not in old:
+        subprocess.call([GOTT_EXEC, "start"] + message_new)
+
+    # Stopped task.
+    elif ('start' not in new or 'end' in new) and 'start' in old:
+        subprocess.call([GOTT_EXEC, "stop"])
+
+    # Modifications to task other than start/stop
+    elif "start" in new and "start" in old:
+        message_old = extract_text(old)
+
+        if message_old != message_new:
+            subprocess.call([GOTT_EXEC, "annotate"] + message_new)
+
